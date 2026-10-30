@@ -1556,74 +1556,117 @@ function stopScan() {
   const layer = document.getElementById("scan");
   if (layer) layer.classList.add("hidden");
 }
-function phoneScan() {
-  const ua = navigator.userAgent || "";
-  if (/Android|iPhone|iPad|iPod/i.test(ua)) return true;
-  return navigator.maxTouchPoints > 1 && /Macintosh/i.test(ua);
-}
 function finishScan(text) {
   const cb = scanOnCode;
   scanOnCode = null;
   stopScan();
   if (cb && text) cb(String(text).trim());
 }
+function sourceSize(source) {
+  return {
+    w: source.videoWidth || source.naturalWidth || source.width || 0,
+    h: source.videoHeight || source.naturalHeight || source.height || 0,
+  };
+}
 function readQrCanvas(canvas) {
-  if (typeof jsQR !== "function") return "";
+  if (typeof jsQR !== "function" || !canvas.width || !canvas.height) return "";
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const code = jsQR(image.data, canvas.width, canvas.height, { inversionAttempts: "attemptBoth" });
-  return code && code.data ? code.data : "";
+  const code = jsQR(image.data, canvas.width, canvas.height, { inversionAttempts: "dontInvert" });
+  if (code && code.data) return code.data;
+  const flipped = jsQR(image.data, canvas.width, canvas.height, { inversionAttempts: "invertFirst" });
+  return flipped && flipped.data ? flipped.data : "";
 }
-function frameOf(source, maxSide, rotate) {
+function canvasFromSource(source, sx, sy, sw, sh, dw, dh, rotate) {
   const rad = ((rotate || 0) * Math.PI) / 180;
   const swap = rotate === 90 || rotate === 270;
-  const srcW = source.videoWidth || source.naturalWidth || source.width;
-  const srcH = source.videoHeight || source.naturalHeight || source.height;
-  const boxW = swap ? srcH : srcW;
-  const boxH = swap ? srcW : srcH;
-  const scale = Math.min(1, maxSide / Math.max(boxW, boxH));
-  const w = Math.max(1, Math.round(boxW * scale));
-  const h = Math.max(1, Math.round(boxH * scale));
+  const w = Math.max(1, Math.round(swap ? dh : dw));
+  const h = Math.max(1, Math.round(swap ? dw : dh));
   const canvas = document.createElement("canvas");
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
   ctx.translate(w / 2, h / 2);
   if (rad) ctx.rotate(rad);
-  ctx.drawImage(source, -srcW * scale / 2, -srcH * scale / 2, srcW * scale, srcH * scale);
+  ctx.drawImage(source, sx, sy, sw, sh, -dw / 2, -dh / 2, dw, dh);
   return canvas;
 }
-async function decodeQrFile(file) {
-  let bitmap = null;
+function scaleFit(sw, sh, maxSide) {
+  const scale = Math.min(1, maxSide / Math.max(sw, sh));
+  return { dw: Math.max(1, Math.round(sw * scale)), dh: Math.max(1, Math.round(sh * scale)) };
+}
+async function detectQr(source) {
+  if (!("BarcodeDetector" in window)) return "";
   try {
-    if (typeof createImageBitmap === "function") bitmap = await createImageBitmap(file);
+    const detector = new BarcodeDetector({ formats: ["qr_code"] });
+    const found = await detector.detect(source);
+    return found && found[0] && found[0].rawValue ? found[0].rawValue : "";
   } catch (_) {
-    bitmap = null;
+    return "";
   }
-  if (!bitmap) {
-    bitmap = await new Promise((resolve, reject) => {
-      const img = new Image();
-      const url = URL.createObjectURL(file);
-      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
-      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image")); };
-      img.src = url;
-    });
+}
+function jsQrWindows(source, thorough) {
+  const { w, h } = sourceSize(source);
+  if (!w || !h) return "";
+  const minSide = Math.min(w, h);
+  const windows = [[0, 0, w, h]];
+  const fracs = thorough ? [1, 0.72, 0.52, 0.36] : [0.72, 0.5];
+  for (const frac of fracs) {
+    const side = Math.max(80, Math.round(minSide * frac));
+    windows.push([Math.round((w - side) / 2), Math.round((h - side) / 2), side, side]);
   }
-  if ("BarcodeDetector" in window) {
-    try {
-      const detector = new BarcodeDetector({ formats: ["qr_code"] });
-      const found = await detector.detect(bitmap);
-      if (found && found[0] && found[0].rawValue) return found[0].rawValue;
-    } catch (_) {}
-  }
-  for (const angle of [0, 90, 270, 180]) {
-    for (const size of [640, 960]) {
-      const text = readQrCanvas(frameOf(bitmap, size, angle));
-      if (text) return text;
+  const angles = thorough ? [0, 90, 270, 180] : [0];
+  const sizes = thorough ? [360, 520, 800] : [420];
+  const seen = new Set();
+  for (const [sx, sy, sw, sh] of windows) {
+    const key = `${sx},${sy},${sw},${sh}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    for (const angle of angles) {
+      for (const maxSide of sizes) {
+        const fit = scaleFit(sw, sh, maxSide);
+        const text = readQrCanvas(canvasFromSource(source, sx, sy, sw, sh, fit.dw, fit.dh, angle));
+        if (text) return text;
+      }
     }
   }
-  if (bitmap.close) bitmap.close();
   return "";
+}
+async function loadScanImage(file) {
+  if (typeof createImageBitmap === "function") {
+    try {
+      return await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch (_) {}
+    try {
+      return await createImageBitmap(file);
+    } catch (_) {}
+  }
+  return await new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image")); };
+    img.src = url;
+  });
+}
+async function decodeQrFile(file) {
+  let text = await detectQr(file);
+  if (text) return text;
+  const bitmap = await loadScanImage(file);
+  try {
+    text = await detectQr(bitmap);
+    if (text) return text;
+    const { w, h } = sourceSize(bitmap);
+    const fit = scaleFit(w, h, 1600);
+    const work = canvasFromSource(bitmap, 0, 0, w, h, fit.dw, fit.dh, 0);
+    text = await detectQr(work);
+    if (text) return text;
+    return jsQrWindows(work, true) || jsQrWindows(bitmap, true);
+  } finally {
+    if (bitmap && bitmap.close) bitmap.close();
+  }
 }
 function openCapture() {
   const token = scanToken;
@@ -1647,12 +1690,9 @@ function openCapture() {
 }
 function startScan(onCode) {
   scanOnCode = onCode;
-  const secure = window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
-  if (!secure || phoneScan()) {
-    openCapture();
-    return;
-  }
-  liveScan();
+  const canLive = window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+  if (canLive) liveScan();
+  else openCapture();
 }
 async function liveScan() {
   const token = scanToken;
@@ -1672,7 +1712,7 @@ async function liveScan() {
     } catch (_) {
       if (token === scanToken) {
         stopScan();
-        toast(t("openCameraFail"));
+        openCapture();
       }
       return;
     }
@@ -1684,8 +1724,6 @@ async function liveScan() {
   video.srcObject = scanStream;
   try { await video.play(); }
   catch (_) {}
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
   let detector = null;
   if ("BarcodeDetector" in window) {
     try { detector = new BarcodeDetector({ formats: ["qr_code"] }); }
@@ -1704,17 +1742,7 @@ async function liveScan() {
           const codes = await detector.detect(video);
           text = codes && codes[0] ? codes[0].rawValue : "";
         }
-        if (!text && typeof jsQR === "function") {
-          const side = Math.min(video.videoWidth, video.videoHeight);
-          const sx = (video.videoWidth - side) / 2;
-          const sy = (video.videoHeight - side) / 2;
-          canvas.width = 420;
-          canvas.height = 420;
-          ctx.drawImage(video, sx, sy, side, side, 0, 0, 420, 420);
-          const image = ctx.getImageData(0, 0, 420, 420);
-          const code = jsQR(image.data, 420, 420, { inversionAttempts: "attemptBoth" });
-          text = code && code.data ? code.data : "";
-        }
+        if (!text) text = jsQrWindows(video, false);
         if (text && token === scanToken) {
           finishScan(text);
           return;
